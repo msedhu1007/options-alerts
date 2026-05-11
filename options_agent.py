@@ -49,16 +49,28 @@ from polygon_data import get_underlying_price, get_iv_rank, find_target_contract
 # Your watchlist — keep it focused. ~30-50 liquid mid-to-large caps with active options.
 # These are the only names the agent will scan.
 WATCHLIST = [
-    # Mega-cap tech (high option liquidity)
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD",
-    # Mid-cap growth (Lynch territory)
-    "TOST", "CELH", "VRT", "DDOG", "NET", "MNDY", "CRWV",
-    # Cyclicals / catalyst-driven
-    "DECK", "ELF", "WING", "CHWY", "ROKU", "SHOP",
-    # Financials / rate-sensitive
+    # Mega-cap tech
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "ORCL", "NFLX",
+    # Semis
+    "AMD", "AVGO", "MU", "INTC", "QCOM", "TXN", "MRVL", "AMAT", "SNDK",
+    # Enterprise SaaS / cloud
+    "CRM", "NOW", "DDOG", "NET", "PLTR", "SHOP", "MNDY", "CRWV",
+    # Cybersecurity
+    "CRWD", "PANW",
+    # Networking / infra
+    "ANET", "CSCO", "DELL",
+    # Aerospace / defense / space
+    "RKLB",
+    # Mid-cap growth
+    "TOST", "CELH", "VRT",
+    # Retail / consumer
+    "WMT", "COST", "DECK", "ELF", "WING", "CHWY", "ROKU",
+    # Financials / crypto
     "SCHW", "COIN", "HOOD",
-    # Healthcare / biotech with catalysts
-    "MRNA", "VRTX", "ISRG",
+    # Storage
+    "WDC", "STX",
+    # Healthcare / biotech
+    "LLY", "MRNA", "VRTX", "ISRG",
     # Index ETFs for hedge / macro plays
     "SPY", "QQQ", "IWM",
 ]
@@ -69,11 +81,12 @@ CRITERIA = {
     "catalyst_window_max_days": 49,   # 7 weeks out
     "target_delta_min": 0.28,
     "target_delta_max": 0.40,
-    "max_iv_rank": 50,                # skip if IV already inflated
+    "max_iv_rank": 40,                # skip if IV already inflated; ≤30 is ideal
     "min_open_interest": 500,
     "max_bid_ask_spread_pct": 0.05,   # 5% of mid price
     "min_score_to_alert": 7,          # 0-10 scale from LLM
     "max_premium_per_contract": 1500, # keeps $1k-per-trade plans viable
+    "max_theta_pct_of_premium": 0.02, # daily theta ≤ 2% of premium
 }
 
 # API keys — set as environment variables
@@ -113,6 +126,8 @@ class OptionSetup:
     delta: float
     iv: float
     iv_rank: float
+    theta: float
+    theta_pct: Optional[float]
     open_interest: int
     bid_ask_spread_pct: float
     underlying_price: float
@@ -189,16 +204,18 @@ The setup:
 - Expiry: {expiry} ({dte} DTE)
 - Premium mid: ${premium:.2f}
 - Delta: {delta:.2f}
-- IV: {iv:.1f}% (IV rank: {iv_rank:.0f})
+- IV: {iv:.1f}% (IV rank: {iv_rank:.0f}) — NOTE: IV rank ≤30 is cheap (good for buying), 30-40 is fair, >40 is elevated
+- Theta: ${theta}/day ({theta_pct_display} of premium daily)
 - Underlying price: ${underlying:.2f}
 - Catalyst: {catalyst_desc} on {catalyst_date} ({days_to_catalyst} days away)
 
 Evaluate on these dimensions:
 1. Is the catalyst genuinely likely to move the stock 8%+ in the expected direction?
-2. Is IV reasonable for the setup (not already pricing in the move)?
-3. Is the strike well-placed (room to run, not too far OTM)?
-4. Is there a clear thesis or just a vague hope?
-5. Are there obvious risks that argue against this trade?
+2. Is IV cheap enough to justify buying? Low IV rank (≤30) is a strong positive — options are underpriced. Score higher when IV rank is low.
+3. Is theta decay manageable relative to expected holding period and catalyst timing?
+4. Is the strike well-placed (room to run, not too far OTM)?
+5. Is there a clear thesis or just a vague hope?
+6. Are there obvious risks that argue against this trade?
 
 Return ONLY a JSON object, no other text:
 {{
@@ -227,6 +244,8 @@ def evaluate_setup(setup: OptionSetup) -> OptionSetup:
         delta=setup.delta,
         iv=setup.iv * 100 if setup.iv < 1 else setup.iv,
         iv_rank=setup.iv_rank,
+        theta=abs(setup.theta) if hasattr(setup, 'theta') and setup.theta else 0,
+        theta_pct_display=f"{setup.theta_pct*100:.1f}%" if hasattr(setup, 'theta_pct') and setup.theta_pct else "N/A",
         underlying=setup.underlying_price,
         catalyst_desc=setup.catalyst.description,
         catalyst_date=setup.catalyst.event_date,
@@ -364,8 +383,10 @@ def run(dry_run: bool = False, test_ticker: Optional[str] = None):
                 delta=contract["delta"],
                 iv=contract["iv"],
                 iv_rank=iv_rank,
+                theta=contract.get("theta", 0),
+                theta_pct=contract.get("theta_pct"),
                 open_interest=contract["open_interest"],
-                bid_ask_spread_pct=contract["spread_pct"],
+                bid_ask_spread_pct=contract.get("spread_pct"),
                 underlying_price=underlying,
                 catalyst=cat,
             )

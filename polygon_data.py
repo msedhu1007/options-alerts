@@ -18,10 +18,13 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import requests
+from dotenv import load_dotenv
 
+load_dotenv()
 
 POLYGON_KEY = os.environ.get("POLYGON_API_KEY")
 POLYGON_BASE = "https://api.polygon.io"
+FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY")
 
 
 # ============================================================================
@@ -29,21 +32,29 @@ POLYGON_BASE = "https://api.polygon.io"
 # ============================================================================
 
 def get_underlying_price(ticker: str) -> Optional[float]:
-    """Last trade price from Polygon."""
-    url = f"{POLYGON_BASE}/v2/last/trade/{ticker}"
-    try:
-        r = requests.get(url, params={"apiKey": POLYGON_KEY}, timeout=10)
-        r.raise_for_status()
-        return float(r.json()["results"]["p"])
-    except Exception as e:
-        # Fallback to previous close if last trade unavailable (e.g., outside market hours)
+    """Current price via Finnhub (real-time), Polygon prev close as fallback."""
+    # Finnhub — free, real-time during market hours
+    if FINNHUB_KEY:
         try:
-            url = f"{POLYGON_BASE}/v2/aggs/ticker/{ticker}/prev"
-            r = requests.get(url, params={"apiKey": POLYGON_KEY, "adjusted": "true"}, timeout=10)
-            return float(r.json()["results"][0]["c"])
-        except Exception as e2:
-            print(f"[ERROR] Polygon price fetch failed for {ticker}: {e2}")
-            return None
+            r = requests.get(
+                "https://finnhub.io/api/v1/quote",
+                params={"symbol": ticker, "token": FINNHUB_KEY},
+                timeout=10,
+            )
+            r.raise_for_status()
+            price = r.json().get("c")
+            if price and price > 0:
+                return float(price)
+        except Exception:
+            pass
+    # Fallback: Polygon previous close
+    try:
+        url = f"{POLYGON_BASE}/v2/aggs/ticker/{ticker}/prev"
+        r = requests.get(url, params={"apiKey": POLYGON_KEY, "adjusted": "true"}, timeout=10)
+        return float(r.json()["results"][0]["c"])
+    except Exception as e:
+        print(f"[ERROR] Price fetch failed for {ticker}: {e}")
+        return None
 
 
 # ============================================================================
@@ -62,60 +73,20 @@ def get_iv_rank(ticker: str, lookback_days: int = 252) -> Optional[float]:
     Note: For production use, ORATS or FlashAlpha give you IV rank directly
     pre-computed. This approximation is good enough for screening.
     """
-    # 1. Get current 30-day ATM IV from snapshot
-    try:
-        url = f"{POLYGON_BASE}/v3/snapshot/options/{ticker}"
-        r = requests.get(url, params={"apiKey": POLYGON_KEY, "limit": 250}, timeout=15)
-        r.raise_for_status()
-        results = r.json().get("results", [])
-    except Exception as e:
-        print(f"[ERROR] Polygon snapshot failed for {ticker}: {e}")
-        return None
-
-    if not results:
-        return None
-
-    # Find ATM contracts with ~30 DTE
+    # 1. Get current IV — use realized vol as proxy since Polygon Starter
+    #    doesn't reliably populate implied_volatility on all contracts
     underlying = get_underlying_price(ticker)
     if not underlying:
         return None
 
     today = datetime.now().date()
-    candidates = []
-    for c in results:
-        details = c.get("details", {})
-        if details.get("contract_type") != "call":
-            continue
-        strike = details.get("strike_price")
-        exp = details.get("expiration_date")
-        if not (strike and exp):
-            continue
-        try:
-            dte = (datetime.strptime(exp, "%Y-%m-%d").date() - today).days
-        except Exception:
-            continue
-        if not (20 <= dte <= 45):
-            continue
-        iv = c.get("implied_volatility")
-        if iv is None:
-            continue
-        # Closer to ATM = better
-        candidates.append((abs(strike - underlying), iv, dte))
 
-    if not candidates:
-        return None
-    candidates.sort()
-    current_iv = candidates[0][1]
-
-    # 2. Historical IV — pull from daily option snapshots for past year
-    # Polygon Starter doesn't include historical IV directly per snapshot,
-    # so we use a proxy: realized vol from underlying historical prices.
-    # This is a reasonable approximation since IV tracks RV closely on average.
+    # 2. Pull historical prices to compute rolling realized vol
     try:
         start = (today - timedelta(days=lookback_days + 30)).isoformat()
         end = today.isoformat()
         url = f"{POLYGON_BASE}/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
-        r = requests.get(url, params={"apiKey": POLYGON_KEY, "adjusted": "true", "limit": 5000}, timeout=15)
+        r = requests.get(url, params={"apiKey": POLYGON_KEY, "adjusted": "true", "limit": 5000}, timeout=30)
         bars = r.json().get("results", [])
     except Exception as e:
         print(f"[ERROR] Polygon history failed for {ticker}: {e}")
@@ -124,7 +95,7 @@ def get_iv_rank(ticker: str, lookback_days: int = 252) -> Optional[float]:
     if len(bars) < 60:
         return None
 
-    # Compute rolling 30-day realized vol as a proxy for historical IV distribution
+    # Compute rolling 30-day realized vol
     closes = [b["c"] for b in bars]
     rolling_rv = []
     for i in range(30, len(closes)):
@@ -141,10 +112,10 @@ def get_iv_rank(ticker: str, lookback_days: int = 252) -> Optional[float]:
     if not rolling_rv:
         return None
 
-    # Rank current IV within distribution of historical realized vol (proxy)
-    # IV typically trades at premium to RV, so we scale RV by ~1.15 average premium
+    # Current RV = last 30-day window, scaled by 1.15 as IV premium proxy
+    current_iv_proxy = rolling_rv[-1] * 1.15
     scaled_rv = [v * 1.15 for v in rolling_rv]
-    below = sum(1 for v in scaled_rv if v < current_iv)
+    below = sum(1 for v in scaled_rv if v < current_iv_proxy)
     iv_rank = (below / len(scaled_rv)) * 100
     return round(iv_rank, 1)
 
@@ -162,32 +133,39 @@ def find_target_contract(ticker: str, direction: str, days_to_expiry_target: int
     DELTA_MAX = 0.40
     MAX_SPREAD_PCT = 0.05
     MIN_OI = 500
+    MAX_THETA_PCT = 0.02
 
     # Polygon contract_type uses "call" / "put"
     contract_type = direction.lower()
 
-    # 1. Pull options snapshot for the underlying — this includes greeks + IV
+    # 1. Pull options snapshot filtered to target expiry window
     url = f"{POLYGON_BASE}/v3/snapshot/options/{ticker}"
+    today = datetime.now().date()
+    target_date = today + timedelta(days=days_to_expiry_target)
+    exp_from = (today + timedelta(days=max(days_to_expiry_target - 14, 7))).isoformat()
+    exp_to = (today + timedelta(days=days_to_expiry_target + 14)).isoformat()
+
     params = {
         "apiKey": POLYGON_KEY,
         "contract_type": contract_type,
+        "expiration_date.gte": exp_from,
+        "expiration_date.lte": exp_to,
         "limit": 250,
     }
 
-    today = datetime.now().date()
-    target_date = today + timedelta(days=days_to_expiry_target)
-
     candidates = []
     next_url = url
+    debug = os.environ.get("DEBUG", "").lower() in ("1", "true")
+    filter_stats = {"total": 0, "dte": 0, "delta": 0, "quote": 0, "spread": 0, "oi": 0, "passed": 0}
 
     # Paginate through results
     page = 0
     while next_url and page < 5:  # cap at 5 pages
         try:
             if page == 0:
-                r = requests.get(next_url, params=params, timeout=15)
+                r = requests.get(next_url, params=params, timeout=30)
             else:
-                r = requests.get(next_url, params={"apiKey": POLYGON_KEY}, timeout=15)
+                r = requests.get(next_url, params={"apiKey": POLYGON_KEY}, timeout=30)
             r.raise_for_status()
             data = r.json()
         except Exception as e:
@@ -199,6 +177,7 @@ def find_target_contract(ticker: str, direction: str, days_to_expiry_target: int
             greeks = c.get("greeks", {})
             day = c.get("day", {})
             last_quote = c.get("last_quote", {})
+            filter_stats["total"] += 1
 
             exp = details.get("expiration_date")
             if not exp:
@@ -209,27 +188,48 @@ def find_target_contract(ticker: str, direction: str, days_to_expiry_target: int
                 continue
             dte = (exp_date - today).days
 
-            # Only consider expirations within +/- 14 days of target
             if abs(dte - days_to_expiry_target) > 14:
+                filter_stats["dte"] += 1
                 continue
 
             delta = abs(greeks.get("delta", 0))
             if not (DELTA_MIN <= delta <= DELTA_MAX):
+                filter_stats["delta"] += 1
                 continue
 
-            bid = last_quote.get("bid", 0)
-            ask = last_quote.get("ask", 0)
-            if not bid or not ask or ask <= 0:
-                continue
-
-            mid = (bid + ask) / 2
-            spread_pct = (ask - bid) / mid if mid > 0 else 1
-            if spread_pct > MAX_SPREAD_PCT:
-                continue
+            # Try last_quote first, fall back to day close
+            bid = (last_quote or {}).get("bid", 0)
+            ask = (last_quote or {}).get("ask", 0)
+            if bid and ask and ask > 0:
+                mid = (bid + ask) / 2
+                spread_pct = (ask - bid) / mid if mid > 0 else 1
+                if spread_pct > MAX_SPREAD_PCT:
+                    filter_stats["spread"] += 1
+                    continue
+            else:
+                mid = day.get("close", 0)
+                if not mid or mid <= 0:
+                    filter_stats["quote"] += 1
+                    continue
+                spread_pct = None
 
             oi = c.get("open_interest", 0)
             if oi < MIN_OI:
+                filter_stats["oi"] += 1
                 continue
+
+            # Theta filter — daily decay ≤ 2% of premium
+            theta = abs(greeks.get("theta", 0))
+            if mid > 0 and theta > 0:
+                theta_pct = theta / mid
+                if theta_pct > MAX_THETA_PCT:
+                    filter_stats.setdefault("theta", 0)
+                    filter_stats["theta"] += 1
+                    continue
+            else:
+                theta_pct = None
+
+            filter_stats["passed"] += 1
 
             iv = c.get("implied_volatility", 0)
 
@@ -239,14 +239,19 @@ def find_target_contract(ticker: str, direction: str, days_to_expiry_target: int
                 "expiry": exp,
                 "mid": round(mid, 2),
                 "delta": delta if contract_type == "call" else -delta,
+                "theta": round(-theta, 4),
+                "theta_pct": round(theta_pct, 4) if theta_pct else None,
                 "iv": iv,
                 "open_interest": oi,
-                "spread_pct": round(spread_pct, 3),
+                "spread_pct": round(spread_pct, 3) if spread_pct is not None else None,
                 "dte_distance": abs(dte - days_to_expiry_target),
             })
 
         next_url = data.get("next_url")
         page += 1
+
+    if debug or not candidates:
+        print(f"  [{ticker} {contract_type}] Filter stats: {filter_stats}")
 
     if not candidates:
         return None
