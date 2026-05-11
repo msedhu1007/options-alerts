@@ -1,0 +1,5 @@
+requests
+anthropic
+sendgrid
+twilio
+python-dotenv
