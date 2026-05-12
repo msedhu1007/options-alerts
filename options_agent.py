@@ -456,39 +456,56 @@ def format_alert(setup: OptionSetup) -> str:
     )
 
 
+SENDGRID_FROM = os.environ.get("SENDGRID_FROM_EMAIL", ALERT_EMAIL)
+
+
 def send_email(subject: str, body: str):
     if not SENDGRID_KEY:
+        print("[EMAIL] skipped — no SENDGRID_API_KEY")
         return
     from sendgrid import SendGridAPIClient
     from sendgrid.helpers.mail import Mail
-    mail = Mail(from_email="alerts@yourdomain.com", to_emails=ALERT_EMAIL,
+    mail = Mail(from_email=SENDGRID_FROM, to_emails=ALERT_EMAIL,
                 subject=subject, plain_text_content=body)
-    SendGridAPIClient(SENDGRID_KEY).send(mail)
-    print(f"[EMAIL] {subject}\n{body}\n")  # placeholder
+    try:
+        response = SendGridAPIClient(SENDGRID_KEY).send(mail)
+        print(f"[EMAIL] sent to {ALERT_EMAIL} (status {response.status_code})")
+    except Exception as e:
+        print(f"[EMAIL ERROR] {e}")
 
 
 def send_sms(body: str):
-    if not (TWILIO_SID and TWILIO_TOKEN):
-        return
-    # from twilio.rest import Client as TwilioClient
-    # TwilioClient(TWILIO_SID, TWILIO_TOKEN).messages.create(
-    #     body=body[:1500], from_=TWILIO_FROM, to=TWILIO_TO)
-    print(f"[SMS] {body[:160]}...\n")
+    # TODO: uncomment when TWILIO_AUTH_TOKEN is set in .env
+    # if not (TWILIO_SID and TWILIO_TOKEN):
+    #     print("[SMS] skipped — no TWILIO credentials")
+    #     return
+    # try:
+    #     from twilio.rest import Client as TwilioClient
+    #     msg = TwilioClient(TWILIO_SID, TWILIO_TOKEN).messages.create(
+    #         body=body[:1500], from_=TWILIO_FROM, to=TWILIO_TO)
+    #     print(f"[SMS] sent to {TWILIO_TO} (sid: {msg.sid})")
+    # except ImportError:
+    #     print("[SMS] skipped — twilio package not installed (pip install twilio)")
+    # except Exception as e:
+    #     print(f"[SMS ERROR] {e}")
+    pass
 
 
 def send_push(title: str, body: str):
     """Free push via ntfy.sh — install ntfy app, subscribe to your topic."""
     if not NTFY_TOPIC:
+        print("[PUSH] skipped — no NTFY_TOPIC")
         return
     try:
-        requests.post(
+        r = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=body.encode("utf-8"),
             headers={"Title": title, "Priority": "high", "Tags": "chart_with_upwards_trend"},
             timeout=5,
         )
+        print(f"[PUSH] sent to ntfy.sh/{NTFY_TOPIC} (status {r.status_code})")
     except Exception as e:
-        print(f"[ERROR] Push failed: {e}")
+        print(f"[PUSH ERROR] {e}")
 
 
 def dispatch_alert(setup: OptionSetup, dry_run: bool = False):
@@ -735,9 +752,61 @@ def run(dry_run: bool = False, test_ticker: Optional[str] = None):
         dispatch_alert(setup, dry_run=dry_run)
 
 
+def test_alerts():
+    """Send a fake alert through all notification channels to verify setup."""
+    print("Testing all notification channels...\n")
+
+    fake_setup = OptionSetup(
+        ticker="TEST",
+        direction="call",
+        strike=150.0,
+        expiry="2026-07-17",
+        premium_mid=5.25,
+        delta=0.34,
+        iv=0.28,
+        iv_rank=25.0,
+        theta=-0.12,
+        theta_pct=0.023,
+        open_interest=2500,
+        bid_ask_spread_pct=0.02,
+        underlying_price=145.50,
+        catalyst=Catalyst(
+            ticker="TEST",
+            event_type="earnings",
+            event_date="2026-06-15",
+            days_until=35,
+            description="Q2 earnings — EPS est: $2.10",
+        ),
+        trend_summary="bullish (3/3) | trend:20>50,HH/HL | compressed(ATR 0.5x) near highs | RS vs SPY:+6.2pp",
+        score=8,
+        thesis=(
+            "Strong momentum into earnings with institutional accumulation.\n"
+            "Key risk: Broad market selloff ahead of FOMC.\n"
+            "Profit target: +100% | Stop: TEST below $138.00"
+        ),
+    )
+
+    body = format_alert(fake_setup)
+    subject = f"[TEST] Options setup: TEST CALL (8/10)"
+
+    print(f"Alert content:\n{'='*60}\n{subject}\n{'='*60}\n{body}\n{'='*60}\n")
+    print("Sending to all channels:\n")
+
+    send_email(subject, body)
+    send_sms(body)
+    send_push(subject, body)
+
+    print("\nDone. Check your email, phone, and ntfy app.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Don't send alerts, just print")
     parser.add_argument("--test", type=str, help="Test with a single ticker")
+    parser.add_argument("--test-alert", action="store_true", help="Send test notification to all channels")
     args = parser.parse_args()
-    run(dry_run=args.dry_run, test_ticker=args.test)
+
+    if args.test_alert:
+        test_alerts()
+    else:
+        run(dry_run=args.dry_run, test_ticker=args.test)
