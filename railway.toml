@@ -2,4 +2,4 @@
 builder = "DOCKERFILE"
 
 [deploy]
-cronSchedule = "0 11 * * 1-5"
+cronSchedule = "30 14 * * 1-5"

@@ -24,7 +24,7 @@ Requires env vars: `FINNHUB_API_KEY`, `POLYGON_API_KEY`, `ANTHROPIC_API_KEY`. Op
 Two-file pipeline, split so the data provider is swappable:
 
 - **`options_agent.py`** — main pipeline with 4 layers:
-  1. **Catalyst feed** (`fetch_earnings_catalysts`) — Finnhub API, filters to `CRITERIA` window
+  1. **Catalyst feed** (`fetch_catalysts`) — merges three sources: earnings (Finnhub), FOMC (hardcoded schedule), economic calendar (Finnhub). Deduplicates by (ticker, date), prioritizes earnings > FOMC > econ. Macro events only assigned to `MACRO_SENSITIVE` tickers (indices, mega-caps, financials).
   2. **Option chain + IV rank** — delegates to `polygon_data.py` via three imported functions
   3. **LLM evaluator** (`evaluate_setup`) — Claude scores 0–10 with JSON-only response, uses `claude-sonnet-4-5`
   4. **Notifications** (`dispatch_alert`) — email (SendGrid), SMS (Twilio), push (ntfy.sh)
