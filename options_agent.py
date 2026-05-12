@@ -583,8 +583,8 @@ def _setup_label(trend: dict) -> str:
         return "Ranging"
 
 
-def print_scanner_table(catalysts: list, ticker_data: dict):
-    """Print rich summary table of all scanned tickers."""
+def build_scanner_table(catalysts: list, ticker_data: dict) -> str:
+    """Build rich summary table of all scanned tickers. Returns table as string."""
 
     # Build rows: one per unique ticker (with its best/first catalyst)
     seen = set()
@@ -634,33 +634,32 @@ def print_scanner_table(catalysts: list, ticker_data: dict):
     # Sort: PASS first (lowest IV rank), then rest
     rows.sort(key=lambda r: (0 if r["status"] == "PASS" else 1, r["iv_rank"] or 999))
 
-    # Print table
-    print(f"\n{'='*120}")
-    print(f"{'SCANNER SUMMARY':^120}")
-    print(f"{'='*120}")
+    # Build table string
+    lines = []
+    lines.append(f"{'='*90}")
+    lines.append(f"{'SCANNER SUMMARY':^90}")
+    lines.append(f"{'='*90}")
 
-    header = (f"{'Ticker':<7} {'Cat':>5} {'Days':>4}  {'IV Rank':<15} "
-              f"{'Trend':<22} {'MAs':<6} {'Struct':<7} {'RS/SPY':<9} "
-              f"{'Setup':<16} {'Dir':<6} {'Status':<8}")
-    print(header)
-    print("-" * 120)
+    lines.append(
+        f"{'Ticker':<7} {'Cat':>8} {'Days':>4}  {'IV Rank':<15} "
+        f"{'Trend':<22} {'MAs':<6} {'Struct':<7} {'RS/SPY':<9} "
+        f"{'Setup':<16} {'Dir':<6}"
+    )
+    lines.append("-" * 90)
 
     for r in rows:
-        line = (f"{r['ticker']:<7} {r['catalyst']:>5} {r['days']:>4}  "
+        marker = ">" if r["status"] == "PASS" else " "
+        line = (f"{marker} {r['ticker']:<6} {r['catalyst']:>8} {r['days']:>4}  "
                 f"{r['iv_label']:<15} {r['trend']:<22} {r['ma']:<6} "
                 f"{r['structure']:<7} {r['rs']:<9} {r['setup']:<16} "
-                f"{r['direction']:<6} {r['status']:<8}")
+                f"{r['direction']:<6}")
+        lines.append(line)
 
-        # Mark passing rows
-        if r["status"] == "PASS":
-            line = f"▶ {line}"
-        else:
-            line = f"  {line}"
-        print(line)
-
-    print("-" * 120)
+    lines.append("-" * 90)
     passing = sum(1 for r in rows if r["status"] == "PASS")
-    print(f"  {len(rows)} tickers scanned | {passing} passed all filters\n")
+    lines.append(f"  {len(rows)} tickers scanned | {passing} passed IV filter")
+
+    return "\n".join(lines)
 
 
 # ============================================================================
@@ -703,7 +702,8 @@ def run(dry_run: bool = False, test_ticker: Optional[str] = None):
             print(f"  {t}: IV rank {rank:.1f} ✓ | {trend['summary']} → {trend['direction']}")
 
     # Print summary table before proceeding to contract selection + LLM eval
-    print_scanner_table(catalysts, ticker_data)
+    scanner_table = build_scanner_table(catalysts, ticker_data)
+    print(f"\n{scanner_table}\n")
 
     qualified = []
     for cat in catalysts:
@@ -750,6 +750,70 @@ def run(dry_run: bool = False, test_ticker: Optional[str] = None):
     print(f"\n{len(qualified)} setup(s) qualified for alert")
     for setup in qualified:
         dispatch_alert(setup, dry_run=dry_run)
+
+    # Build full scan report
+    scanned = len(set(cat.ticker for cat in catalysts))
+    passed = sum(1 for t, d in ticker_data.items() if d[1] is not None and d[1] <= CRITERIA["max_iv_rank"])
+
+    report_parts = [
+        f"Options Scanner Report — {datetime.now().strftime('%Y-%m-%d %H:%M ET')}",
+        f"Catalysts: {len(catalysts)} (earnings: {earnings_count}, FOMC: {fed_count}, econ: {econ_count})",
+        "",
+        scanner_table,
+    ]
+
+    # Append LLM evaluation results if any tickers were evaluated
+    eval_lines = []
+    for cat in catalysts:
+        data = ticker_data.get(cat.ticker)
+        if not data:
+            continue
+        _, iv_rank, trend = data
+        if iv_rank is None or iv_rank > CRITERIA["max_iv_rank"]:
+            continue
+        # This ticker was evaluated — find its scores from qualified + non-qualified
+        eval_lines.append(f"  {cat.ticker} ({cat.event_type}): direction={trend.get('direction', '?')}")
+
+    if qualified:
+        report_parts.append("")
+        report_parts.append(f"ALERTS ({len(qualified)}):")
+        for setup in qualified:
+            report_parts.append(f"  [{setup.score}/10] {setup.ticker} {setup.direction.upper()} "
+                                f"${setup.strike} {setup.expiry}")
+            if setup.thesis:
+                for thesis_line in setup.thesis.split("\n"):
+                    report_parts.append(f"    {thesis_line}")
+    else:
+        report_parts.append("")
+        report_parts.append("No setups scored 7+. All quiet today.")
+
+    report_parts.append("")
+    report_parts.append(f"Summary: {scanned} scanned | {passed} passed IV | {len(qualified)} alerted")
+
+    full_report = "\n".join(report_parts)
+
+    # Send report via email + push (unless dry-run)
+    if not dry_run:
+        subject = (f"Scanner: {len(qualified)} alert(s) | "
+                   f"{passed}/{scanned} passed | {datetime.now().strftime('%m/%d')}")
+        send_email(subject, full_report)
+
+        # Push: shorter summary (ntfy has char limit)
+        push_summary = (f"{scanned} scanned | {passed} passed IV | "
+                        f"{len(qualified)} alerted (≥{CRITERIA['min_score_to_alert']})")
+        if qualified:
+            push_summary += "\n" + "\n".join(
+                f"[{s.score}/10] {s.ticker} {s.direction.upper()} ${s.strike}"
+                for s in qualified
+            )
+        else:
+            push_summary += "\nAll quiet — no setups today."
+        send_push(f"Scan: {len(qualified)} alert(s)", push_summary)
+    else:
+        print(f"\n{'='*60}")
+        print("FULL REPORT (dry-run, not sent)")
+        print(f"{'='*60}")
+        print(full_report)
 
 
 def test_alerts():
